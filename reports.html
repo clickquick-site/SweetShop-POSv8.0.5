@@ -1394,6 +1394,7 @@ let allExpenses = [];
 let allDebts = [];
 let allUsers = [];
 let allTransactions = [];
+let allDebtPayments = [];
 
 let salesChart = null;
 let familiesChart = null;
@@ -1439,16 +1440,21 @@ async function init() {
 //  تحميل البيانات
 // ============================================================
 async function loadAllData() {
-  allSales = await window.dbManager.getAll('sales');
-  allItems = await window.dbManager.getAll('saleItems');
-  allCustomers = await window.dbManager.getAll('customers');
-  allProducts = await window.dbManager.getAll('products');
-  allFamilies = await window.dbManager.getAll('families');
-  allExpenses = await window.dbManager.getAll('expenses');
-  allDebts = await window.dbManager.getAll('debts');
-  allUsers = await window.dbManager.getAll('users');
-  // ✅ الحركات المالية — مصدر الحقيقة للتسديدات والمصاريف
-  allTransactions = await window.dbManager.getAll('transactions');
+  allSales        = await window.dbManager.getAll('sales');
+  allItems        = await window.dbManager.getAll('saleItems');
+  allCustomers    = await window.dbManager.getAll('customers');
+  allProducts     = await window.dbManager.getAll('products');
+  allFamilies     = await window.dbManager.getAll('families');
+  allExpenses     = await window.dbManager.getAll('expenses');
+  allDebts        = await window.dbManager.getAll('debts');
+  allUsers        = await window.dbManager.getAll('users');
+  allDebtPayments = await window.dbManager.getAll('debtPayments');
+  // ✅ تحميل transactions مع حماية من عدم وجود الجدول في DB القديم
+  try {
+    allTransactions = await window.dbManager.getAll('transactions');
+  } catch (e) {
+    allTransactions = [];
+  }
 }
 
 // ============================================================
@@ -1542,29 +1548,60 @@ function updateDateDisplay() {
 // ============================================================
 async function updateSidebarValues() {
   const today = window.dateUtils.today();
-  
-  // ✅ مبيعات حقيقية فقط (بدون وصولات التسديد)
+
+  // ✅ نقدي مقبوض من المبيعات (paid فقط — الديون paid=0)
   const todaySales = allSales.filter(s =>
     !s.isCancelled &&
     s.date.startsWith(today) &&
-    s.invoiceKind !== 'settlement' &&
-    s.invoiceKind !== 'partial'
+    s.invoiceKind !== 'settlement'
   );
   const salesCash = todaySales.reduce((sum, s) => sum + (s.paid || 0), 0);
 
-  // ✅ تسديدات الديون اليوم من transactions
-  const todayPayments = allTransactions.filter(t =>
-    t.type === 'debt_payment' && t.date.startsWith(today)
-  );
-  const paymentsCash = todayPayments.reduce((sum, t) => sum + (t.amount || 0), 0);
+  // ✅ تسديدات الديون من debtPayments
+  const todayDebtPmts = allDebtPayments.filter(p => p.date.startsWith(today));
+  const paymentsCash  = todayDebtPmts.reduce((sum, p) => sum + (p.amount || 0), 0);
 
+  // ✅ إجمالي النقد المقبوض فعلاً
   const dailyTotal = salesCash + paymentsCash;
   document.getElementById('dailyValue').textContent = window.currencyFormatter.formatWithoutSymbol(dailyTotal);
-  
-  // ديون قائمة
-  const todayDebts = allDebts.filter(d => !d.isPaid && d.date.startsWith(today));
-  const debtsTotal = todayDebts.reduce((sum, d) => sum + (d.amount || 0), 0);
+
+  // ✅ ديون قائمة غير مسددة
+  const activeDebts = allDebts.filter(d => !d.isPaid);
+  const debtsTotal  = activeDebts.reduce((sum, d) => sum + (d.amount || 0), 0);
   document.getElementById('debtsValue').textContent = window.currencyFormatter.formatWithoutSymbol(debtsTotal);
+}
+
+// ============================================================
+//  حساب الربح التناسبي على التسديدات — دالة مساعدة
+// ============================================================
+function calcSaleCost(saleId) {
+  const items = allItems.filter(i => i.saleId === saleId);
+  let cost = 0;
+  for (const item of items) {
+    const product = allProducts.find(p => p.id === item.productId);
+    cost += (product?.buyPrice || 0) * item.quantity;
+  }
+  return cost;
+}
+
+function calcProportionalProfit(saleId, paymentAmount) {
+  const sale = allSales.find(s => s.id === saleId);
+  if (!sale || !sale.total) return 0;
+  const cost = calcSaleCost(saleId);
+  const marginRate = (sale.total - cost) / sale.total;
+  return paymentAmount * marginRate;
+}
+
+// حساب ربح تسديدات الديون في تاريخ معين
+function calcDebtPaymentsProfit(date) {
+  const dayPayments = allDebtPayments.filter(p => p.date.startsWith(date));
+  let profit = 0;
+  for (const payment of dayPayments) {
+    const debt = allDebts.find(d => d.id === payment.debtId);
+    if (!debt || !debt.saleId) continue;
+    profit += calcProportionalProfit(debt.saleId, payment.amount);
+  }
+  return profit;
 }
 
 // ============================================================
@@ -1573,77 +1610,76 @@ async function updateSidebarValues() {
 async function loadDashboard() {
   const today = window.dateUtils.today();
   const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
-  
-  // ✅ مبيعات حقيقية فقط — بدون وصولات التسديد
+
+  // ✅ مبيعات حقيقية فقط — بدون وصولات التسديد القديم
   const todaySales = allSales.filter(s =>
     !s.isCancelled &&
     s.date.startsWith(today) &&
-    s.invoiceKind !== 'settlement' &&
-    s.invoiceKind !== 'partial'
+    s.invoiceKind !== 'settlement'
   );
   const yesterdaySales = allSales.filter(s =>
     !s.isCancelled &&
     s.date.startsWith(yesterday) &&
-    s.invoiceKind !== 'settlement' &&
-    s.invoiceKind !== 'partial'
+    s.invoiceKind !== 'settlement'
   );
 
-  // نقدي من المبيعات الحقيقية
-  const salesCash = todaySales.reduce((sum, s) => sum + (s.paid || 0), 0);
-  const yesterdayRevenue = yesterdaySales.reduce((sum, s) => sum + (s.paid || 0), 0);
+  // ✅ نقدي مقبوض من المبيعات فقط (paid) — الدين paid=0 لا يُحسب
+  const salesCash    = todaySales.reduce((sum, s) => sum + (s.paid  || 0), 0);
+  const totalSales   = todaySales.reduce((sum, s) => sum + (s.total || 0), 0);
+  const newDebts     = todaySales.reduce((sum, s) => sum + Math.max(0,(s.total||0)-(s.paid||0)), 0);
+  const yesterdayCash = yesterdaySales.reduce((sum, s) => sum + (s.paid || 0), 0);
 
-  // ✅ تسديدات الديون اليوم من transactions
-  const todayPayments = allTransactions.filter(t =>
-    t.type === 'debt_payment' && t.date.startsWith(today)
-  );
-  const paymentsCash = todayPayments.reduce((sum, t) => sum + (t.amount || 0), 0);
+  // ✅ تسديدات الديون اليوم من debtPayments (المرجع الأدق)
+  const dayDebtPayments = allDebtPayments.filter(p => p.date.startsWith(today));
+  const paymentsCash = dayDebtPayments.reduce((sum, p) => sum + (p.amount || 0), 0);
 
-  // إجمالي ما قُبض فعلاً اليوم
+  // ✅ إجمالي ما قُبض فعلاً = نقدي من مبيعات + تسديدات ديون
   const todayRevenue = salesCash + paymentsCash;
-  
-  // حساب التكلفة — فقط على المبيعات الحقيقية المقبوضة
-  let todayCost = 0;
+
+  // ✅ ربح المبيعات النقدية — تكلفة تناسبية لما دُفع فقط
+  let cashSalesProfit = 0;
   for (const sale of todaySales.filter(s => (s.paid || 0) > 0)) {
-    const items = allItems.filter(i => i.saleId === sale.id);
-    for (const item of items) {
-      const product = allProducts.find(p => p.id === item.productId);
-      todayCost += (product?.buyPrice || 0) * item.quantity;
-    }
+    const cost = calcSaleCost(sale.id);
+    const paidRatio = sale.total > 0 ? (sale.paid / sale.total) : 1;
+    cashSalesProfit += (sale.paid || 0) - (cost * paidRatio);
   }
-  
-  // ✅ مصاريف اليوم — فقط التي include_in_reports = true
+
+  // ✅ ربح تسديدات الديون — تناسبي بالنسبة لهامش البيع الأصلي
+  const debtPaymentsProfit = calcDebtPaymentsProfit(today);
+
+  // ✅ مصاريف اليوم — فقط include_in_reports = true
   const todayExpenses = allExpenses.filter(e =>
     e.date?.startsWith(today) &&
     e.isPaid &&
     e.include_in_reports === true
   );
   const expensesTotal = todayExpenses.reduce((sum, e) => sum + (e.amount || 0), 0);
-  
-  // صافي الربح
-  const todayProfit = todayRevenue - todayCost - expensesTotal;
-  
-  // ديون جديدة اليوم
-  const todayDebts = allDebts.filter(d => !d.isPaid && d.date.startsWith(today));
-  const debtsTotal = todayDebts.reduce((sum, d) => sum + (d.amount || 0), 0);
-  
-  // ✅ تسديدات اليوم من transactions
-  const settledTotal = paymentsCash;
-  const settledCount = todayPayments.length;
 
-  document.getElementById('kpiRevenue').textContent = window.currencyFormatter.format(todayRevenue);
-  document.getElementById('kpiProfit').textContent = window.currencyFormatter.format(todayProfit);
+  // ✅ صافي الربح الحقيقي
+  const todayProfit = cashSalesProfit + debtPaymentsProfit - expensesTotal;
+
+  // ديون قائمة (غير مسددة)
+  const activeDebts = allDebts.filter(d => !d.isPaid);
+  const debtsTotal  = activeDebts.reduce((sum, d) => sum + (d.amount || 0), 0);
+
+  // ✅ تسديدات اليوم
+  const settledTotal = paymentsCash;
+  const settledCount = dayDebtPayments.length;
+
+  document.getElementById('kpiRevenue').textContent  = window.currencyFormatter.format(todayRevenue);
+  document.getElementById('kpiProfit').textContent   = window.currencyFormatter.format(todayProfit);
   document.getElementById('kpiExpenses').textContent = window.currencyFormatter.format(expensesTotal);
-  document.getElementById('kpiDebts').textContent = window.currencyFormatter.format(debtsTotal);
-  document.getElementById('debtsCount').textContent = todayDebts.length;
-  document.getElementById('kpiSettled').textContent = window.currencyFormatter.format(settledTotal);
+  document.getElementById('kpiDebts').textContent    = window.currencyFormatter.format(debtsTotal);
+  document.getElementById('debtsCount').textContent  = activeDebts.length;
+  document.getElementById('kpiSettled').textContent  = window.currencyFormatter.format(settledTotal);
   document.getElementById('settledCount').textContent = settledCount;
-  
+
   // حساب التغير مقارنة بالأمس
-  const revenueChange = yesterdayRevenue ? ((todayRevenue - yesterdayRevenue) / yesterdayRevenue * 100).toFixed(1) : 0;
+  const revenueChange = yesterdayCash ? ((todayRevenue - yesterdayCash) / yesterdayCash * 100).toFixed(1) : 0;
   const revenueTrend = document.getElementById('revenueTrend');
   revenueTrend.textContent = (revenueChange > 0 ? '+' : '') + revenueChange + '%';
   revenueTrend.className = revenueChange > 0 ? 'trend-up' : revenueChange < 0 ? 'trend-down' : 'trend-flat';
-  
+
   await updateTicker();
   await updateChart();
   await updateHealthMeter();
@@ -2005,12 +2041,11 @@ async function updateABC() {
 //  آخر المبيعات
 // ============================================================
 async function updateRecentSales() {
-  // ✅ مبيعات حقيقية فقط — بدون وصولات التسديد
+  // ✅ استبعاد وصولات التسديد الكاملة فقط
   const recent = allSales
     .filter(s =>
       !s.isCancelled &&
-      s.invoiceKind !== 'settlement' &&
-      s.invoiceKind !== 'partial'
+      s.invoiceKind !== 'settlement'
     )
     .sort((a, b) => new Date(b.date) - new Date(a.date))
     .slice(0, 10);
@@ -2073,48 +2108,46 @@ function setPeriod(period) {
 // ============================================================
 async function loadDailyReport() {
   const date = document.getElementById('dailyDate').value;
-  
-  // ✅ مبيعات حقيقية فقط — بدون وصولات التسديد
+
+  // ✅ مبيعات حقيقية — بدون وصولات التسديد القديم
   const daySales = allSales.filter(s =>
     !s.isCancelled &&
     s.date.startsWith(date) &&
-    s.invoiceKind !== 'settlement' &&
-    s.invoiceKind !== 'partial'
+    s.invoiceKind !== 'settlement'
   );
 
-  // ✅ تسديدات الديون من transactions
-  const dayPayments = allTransactions.filter(t =>
-    t.type === 'debt_payment' && t.date.startsWith(date)
-  );
-  const settledToday = dayPayments.reduce((sum, t) => sum + (t.amount || 0), 0);
+  // ✅ تسديدات الديون من debtPayments (أدق من transactions)
+  const dayDebtPmts = allDebtPayments.filter(p => p.date.startsWith(date));
+  const settledToday = dayDebtPmts.reduce((sum, p) => sum + (p.amount || 0), 0);
 
-  // الحسابات الصحيحة
+  // ✅ الحسابات المحاسبية الصحيحة
   const totalSales   = daySales.reduce((sum, s) => sum + (s.total || 0), 0);
   const salesCash    = daySales.reduce((sum, s) => sum + (s.paid  || 0), 0);
   const totalCash    = salesCash + settledToday;
   const totalNewDebt = daySales.reduce((sum, s) => sum + Math.max(0,(s.total||0)-(s.paid||0)), 0);
   const count = daySales.length;
-  
-  // ✅ مصاريف اليوم — فقط include_in_reports = true
+
+  // ✅ مصاريف اليوم — include_in_reports = true فقط
   const dayExpenses = allExpenses.filter(e =>
     e.date?.startsWith(date) &&
     e.isPaid &&
     e.include_in_reports === true
   );
   const expensesTotal = dayExpenses.reduce((sum, e) => sum + (e.amount || 0), 0);
-  
-  // حساب التكلفة — فقط على المبيعات الحقيقية المقبوضة
-  let cost = 0;
+
+  // ✅ ربح المبيعات النقدية — تكلفة تناسبية لما دُفع فعلاً
+  let cashSalesProfit = 0;
   for (const sale of daySales.filter(s => (s.paid || 0) > 0)) {
-    const items = allItems.filter(i => i.saleId === sale.id);
-    for (const item of items) {
-      const product = allProducts.find(p => p.id === item.productId);
-      cost += (product?.buyPrice || 0) * item.quantity;
-    }
+    const cost = calcSaleCost(sale.id);
+    const paidRatio = sale.total > 0 ? (sale.paid / sale.total) : 1;
+    cashSalesProfit += (sale.paid || 0) - (cost * paidRatio);
   }
-  
-  const profit = totalCash - cost - expensesTotal;
-  
+
+  // ✅ ربح تسديدات الديون — تناسبي
+  const debtPaymentsProfit = calcDebtPaymentsProfit(date);
+
+  const profit = cashSalesProfit + debtPaymentsProfit - expensesTotal;
+
   document.getElementById('dailyTotal').textContent    = window.currencyFormatter.format(totalSales);
   document.getElementById('dailyCash').textContent     = window.currencyFormatter.format(totalCash);
   document.getElementById('dailyNewDebt').textContent  = window.currencyFormatter.format(totalNewDebt);
@@ -2523,42 +2556,41 @@ async function loadAccounting() {
   const daySales = allSales.filter(s =>
     !s.isCancelled &&
     s.date.startsWith(date) &&
-    s.invoiceKind !== 'settlement' &&
-    s.invoiceKind !== 'partial'
+    s.invoiceKind !== 'settlement'
   );
 
-  // ✅ تسديدات الديون من transactions
-  const dayPayments = allTransactions.filter(t =>
-    t.type === 'debt_payment' && t.date.startsWith(date)
-  );
-  const settledToday = dayPayments.reduce((sum, t) => sum + (t.amount || 0), 0);
+  // ✅ تسديدات الديون من debtPayments
+  const dayDebtPmts = allDebtPayments.filter(p => p.date.startsWith(date));
+  const settledToday = dayDebtPmts.reduce((sum, p) => sum + (p.amount || 0), 0);
 
   const salesCash = daySales.reduce((sum, s) => sum + (s.paid || 0), 0);
-  const revenue = salesCash + settledToday;
-  const count = daySales.length;
-  
-  // حساب التكلفة — فقط على المبيعات الحقيقية المقبوضة
-  let cost = 0;
+  const revenue   = salesCash + settledToday;
+  const count     = daySales.length;
+
+  // ✅ ربح المبيعات النقدية — تناسبي
+  let cashSalesProfit = 0;
   for (const sale of daySales.filter(s => (s.paid || 0) > 0)) {
-    const items = allItems.filter(i => i.saleId === sale.id);
-    for (const item of items) {
-      const product = allProducts.find(p => p.id === item.productId);
-      cost += (product?.buyPrice || 0) * item.quantity;
-    }
+    const cost = calcSaleCost(sale.id);
+    const paidRatio = sale.total > 0 ? (sale.paid / sale.total) : 1;
+    cashSalesProfit += (sale.paid || 0) - (cost * paidRatio);
   }
-  
-  // ✅ المصاريف — فقط include_in_reports = true
+
+  // ✅ ربح تسديدات الديون — تناسبي
+  const debtPaymentsProfit = calcDebtPaymentsProfit(date);
+
+  // ✅ المصاريف — include_in_reports = true فقط
   const dayExpenses = allExpenses.filter(e =>
     e.date?.startsWith(date) &&
     e.isPaid &&
     e.include_in_reports === true
   );
   const expensesTotal = dayExpenses.reduce((sum, e) => sum + (e.amount || 0), 0);
-  
+
   // الديون القائمة
   const totalDebts = allDebts.filter(d => !d.isPaid).reduce((sum, d) => sum + (d.amount || 0), 0);
-  
-  const profit = revenue - cost - expensesTotal;
+
+  const cost   = revenue - cashSalesProfit - debtPaymentsProfit;
+  const profit = cashSalesProfit + debtPaymentsProfit - expensesTotal;
   
   document.getElementById('accRevenue').textContent = window.currencyFormatter.format(revenue);
   document.getElementById('accCost').textContent = window.currencyFormatter.format(cost);
